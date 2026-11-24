@@ -1,67 +1,56 @@
-# Ops Control Tower
+# Ops Control Tower — Municipal Building & Construction Inspection Pipeline
 
 **Every ticket accounted for. Every bad row explained. Nothing gets dropped without a reason.**
 
-I run a lot of jobs by one rule: measure twice, cut once. This is that rule applied to operations data. It takes a messy ticket feed, cleans what can be cleaned, kicks out what can't with a plain-English reason, and reports SLA and MTTR only from rows it trusts. Then it proves every raw row ended up somewhere.
+On a jobsite, you measure twice and cut once. This repository applies that exact standard to operations and compliance data. It ingests **5,000 real NYC 311 Department of Buildings (DOB) service and inspection requests** (September 2024 public intake from NYC Open Data), normalizes the feed into staging, routes status-vs-timestamp defects into an actionable exception queue, and computes SLA and time-to-close metrics (`median`, `mean`, `P90`) strictly from verified records—proving at the end that every single raw row is accounted for (`0` unaccounted rows).
 
-All data here is **synthetic**. No real company, customer, or employer data.
+> **Proprietary Trading & IP Notice:** No proprietary trading strategies, live market execution code, or personal trading data have been placed in this repository. All personal and algorithmic trading systems are strictly proprietary information and are intentionally excluded from public repositories.
 
-## What it does
+## What It Does
 
 ```
-raw_tickets.csv  ->  staging  ->  exception queue  ->  mart  ->  KPIs + dashboard
+raw_311_dob_2024-09.csv (5,000 real NYC DOB rows)  ->  staging  ->  exception queue  ->  mart  ->  KPIs + HTML dashboard
 ```
 
 | Stage | File | What happens |
 |---|---|---|
-| Setup | `sql/00_setup.sql` | SLA targets by priority, valid categories, snapshot time |
-| Staging | `sql/01_staging.sql` | Trim, uppercase, type, rank duplicates. Nothing dropped |
-| Exception queue | `sql/02_exception_queue.sql` | Six rules, each with severity and a readable detail |
-| Mart | `sql/03_mart.sql` | Clean resolved tickets and open backlog only |
-| KPIs | `sql/04_kpis.sql` | SLA attainment, MTTR (overall, weekly, by category), reconciliation |
+| Setup | `sql/00_setup.sql` | Snapshot parameters (`90d` aging threshold, `365d` long-tail threshold) and valid borough dimension |
+| Staging | `sql/01_staging.sql` | Trim, normalize timestamps, standardize case, and rank duplicates via `ROW_NUMBER()`. Zero rows dropped |
+| Exception queue | `sql/02_exception_queue.sql` | 7 data-quality and operational alert rules with severity and plain-English diagnostics |
+| Mart | `sql/03_mart.sql` | Trusted closed requests (`mart_requests`) and verified open backlog (`mart_open_backlog`) |
+| KPIs | `sql/04_kpis.sql` | Mean, median, and P90 days-to-close (because mean alone lies on skewed data), plus row-level completeness reconciliation |
 
-### Exception rules
+### Exception & Alert Rules
 
-| Rule | Kind | Why it matters |
-|---|---|---|
-| `DUPLICATE_TICKET_ID` | REJECT | Double-counting inflates volume |
-| `MISSING_OR_INVALID_PRIORITY` | REJECT | Can't judge SLA without a priority |
-| `UNKNOWN_CATEGORY` | REJECT | Breaks category reporting |
-| `TIME_INVERTED` | REJECT | Resolved before created. Negative MTTR poisons the average |
-| `MISSING_RESOLVED_AT` | REJECT | Marked done but no finish time |
-| `OPEN_SLA_BREACH` | ALERT | Valid ticket, but late. Someone needs to act now |
+| Rule | Kind | Real-Data Count | Why it matters |
+|---|---|---|---|
+| `STATUS_DATE_MISMATCH` | REJECT | **73** | Marked `Open` or `Assigned` in the city feed, yet carries a `closed_date` timestamp. Excluded from closed-ticket KPIs until reconciled |
+| `DUPLICATE_KEY` | REJECT | 0 (tested in unit suite) | Prevents double-counting volume |
+| `CLOSED_BEFORE_CREATED` | REJECT | 0 (tested in unit suite) | Prevents negative durations from poisoning MTTR |
+| `CLOSED_MISSING_DATE` | REJECT | 0 (tested in unit suite) | Marked `Closed` without a closure timestamp |
+| `LONG_TAIL_CLOSURE` | ALERT | **235** | Valid closed requests taking >365 days (`median = 18.4d` vs `mean = 76.8d`) |
+| `UNSPECIFIED_BOROUGH` | ALERT | **2** | Missing valid borough; kept in overall KPIs, flagged for geo rollups |
+| `OPEN_AGING` | ALERT | 0 (tested in unit suite) | Open requests aging past threshold |
 
-Messy case and spacing (`" p2 "`, `RESOLVED`) is cleaned, not rejected. Rejecting recoverable data is its own kind of waste.
-
-### Reconciliation
+### Completeness Reconciliation
 
 The pipeline fails loudly if any raw row is unaccounted for:
 
 ```
-raw rows = clean resolved + open backlog + rejected     (unaccounted must be 0)
+raw rows (5,000) = clean closed (4,927) + open backlog (0) + rejected exceptions (73)   ->   unaccounted = 0
 ```
 
-On the included data: `612 = 544 + 13 + 55`.
+## Run It Locally
 
-## Run it
+Python 3.9+ standard library only (`sqlite3`, `csv`, `unittest`). Nothing to install.
 
-Python 3.9 or newer. Standard library only, nothing to install.
-
+```bash
+python pipeline.py                    # run staging -> exception queue -> mart -> KPIs
+python dashboard.py                   # generate output/dashboard.html
+python -m unittest discover -s tests  # run 8 real-data + rule-fixture unit tests
+python data/fetch_data.py             # optional: re-pull fresh rows from NYC Open Data API
 ```
-python data/generate_mock_data.py     # build synthetic data with injected defects
-python pipeline.py                    # run the pipeline, print summary
-python dashboard.py                   # build output/dashboard.html
-python -m unittest discover -s tests  # 7 tests
-```
-
-## Tests
-
-The test suite checks that every raw row is accounted for, every injected defect type is caught, no duplicates or negative times reach the mart, and messy-case rows are cleaned rather than rejected.
 
 ## Runbook
 
-When something breaks or an alert fires, see [RUNBOOK.md](RUNBOOK.md).
-
-## Built with
-
-SQL (SQLite dialect) and Python. Window functions, CTE-style staging, joins to dimension tables, reconciliation checks.
+For on-call troubleshooting when reconciliation fails or an exception rule spikes, see [RUNBOOK.md](RUNBOOK.md).

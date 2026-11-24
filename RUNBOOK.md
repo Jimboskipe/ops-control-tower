@@ -1,51 +1,39 @@
-# Runbook
+# Runbook — Ops Control Tower
 
-Plain steps for the person on call. If you only read one line: **check `reconciliation` first.**
+Plain steps for the operator on call. First rule: **check `reconciliation` before touching anything else.**
 
-## 1. Pipeline failed with "RECONCILIATION FAILED"
+## 1. Pipeline fails with `RECONCILIATION FAILED`
 
-`unaccounted_rows` is not 0, meaning raw rows went missing between stages.
+`unaccounted_rows` is not `0`, meaning raw rows went missing between `raw_requests` and the final tables.
 
-1. Run `python pipeline.py` and read the counts.
-2. Open `output/ops.db`: `SELECT * FROM reconciliation;`
-3. Find the gap:
-   - `SELECT COUNT(*) FROM raw_tickets;` vs `SELECT COUNT(*) FROM stg_tickets;` Staging must match raw.
-   - If staging is short, a JOIN dropped rows. Check `01_staging.sql`.
-   - If mart is short, a new status value is not `open`, `resolved` or `closed`. Check `SELECT DISTINCT status FROM stg_tickets;`
-4. Fix the rule or add the new status. Re-run. Do not hand-edit the database.
+1. Run `python pipeline.py` and inspect the reconciliation line.
+2. Query `output/ops.db`:
+   ```sql
+   SELECT * FROM reconciliation;
+   SELECT status, COUNT(*) FROM stg_requests GROUP BY 1;
+   ```
+3. If a new status value appeared in the source feed (outside `closed`, `open`, `assigned`), update `02_exception_queue.sql` and `03_mart.sql` so every status is explicitly routed. Never delete raw rows by hand.
 
-## 2. Exception queue spiked
+## 2. Exception queue spikes
 
-1. `SELECT exception_type, COUNT(*) FROM exception_queue WHERE kind='REJECT' GROUP BY 1 ORDER BY 2 DESC;`
-2. Match the top type below.
+Query the breakdown:
+```sql
+SELECT exception_type, kind, severity, COUNT(*)
+FROM exception_queue
+GROUP BY 1, 2, 3
+ORDER BY 4 DESC;
+```
 
-| Spike in | Likely cause | Action |
+| Rule | Cause | Action |
 |---|---|---|
-| `DUPLICATE_TICKET_ID` | Source system re-sent a batch | Ask source owner to dedupe. Keep earliest copy, which the pipeline already does |
-| `MISSING_OR_INVALID_PRIORITY` | New priority label (e.g. `P0`) | Confirm with ops lead. If real, add to `dim_priority_sla` with targets |
-| `UNKNOWN_CATEGORY` | New category | Confirm. If real, add to `dim_category` |
-| `TIME_INVERTED` | Clock or timezone bug in source | Spot-check 5 rows. Raise with source owner. Do not "fix" timestamps here |
-| `MISSING_RESOLVED_AT` | Tickets closed without a timestamp | Send list to the team that closes tickets |
+| `STATUS_DATE_MISMATCH` | Source ticket has `status IN ('open','assigned')` but a populated `closed_date` (73 rows in the Sep 2024 NYC DOB feed) | Export the affected `unique_key` list and flag for upstream source reconciliation. Do not guess whether the status or the timestamp is right |
+| `DUPLICATE_KEY` | Upstream batch re-sent existing keys | Pipeline automatically retains `dup_rank = 1` and rejects later copies |
+| `CLOSED_BEFORE_CREATED` | Timezone shift or backdated closure timestamp | Reject from timing KPIs and report `unique_key` list to source owner |
+| `CLOSED_MISSING_DATE` | Ticket closed without a timestamp | Route to ticketing admin team |
+| `LONG_TAIL_CLOSURE` | Multi-year inspection backlogs closing in bulk | Always report **median** and **P90** alongside the mean so bulk backlog sweeps do not distort weekly ops reviews |
 
-## 3. SLA alert (`OPEN_SLA_BREACH`)
+## 3. Ground Rules
 
-1. List the worst:
-   `SELECT ticket_id, priority, age_hours, resolve_target_hours FROM mart_open_backlog WHERE age_hours > resolve_target_hours ORDER BY age_hours DESC;`
-2. P1 and P2 first. Assign a human, post in the ops channel, note the ticket IDs.
-3. Re-run after the shift to confirm they cleared.
-
-## 4. MTTR looks wrong
-
-1. Is `mart_tickets` row count reasonable against the week before?
-2. `SELECT MIN(resolve_hours), MAX(resolve_hours) FROM mart_tickets;` A negative minimum means a `TIME_INVERTED` rule gap.
-3. One huge outlier? Check that ticket in `stg_tickets` before touching any rule.
-
-## 5. Changing SLA targets
-
-Edit the numbers in `sql/00_setup.sql`, re-run, and note the change and the date in the commit message so history stays honest.
-
-## Ground rules
-
-- Never delete a raw row. Reject it with a reason.
-- Never silently fix data. Clean what is obviously formatting, reject what is genuinely wrong, and say which.
-- If the numbers do not reconcile, nothing ships.
+- Never delete a raw row. Route bad rows to `exception_queue` with a specific rule code.
+- Always report `median_days` and `p90_days` next to `mean_days`.
+- If `unaccounted_rows != 0`, nothing ships.
